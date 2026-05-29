@@ -5,8 +5,7 @@ These rules apply to every AI coding session for NeuraFlash users. The
 rules file for each detected tool:
 
 - Claude Code → `~/.claude/CLAUDE.md`
-- OpenAI Codex CLI → `~/.codex/AGENTS.md`
-- Google Antigravity (Gemini CLI) → `~/.gemini/GEMINI.md`
+- OpenAI Codex (CLI + app) → `~/.codex/AGENTS.md`
 
 The merge is idempotent (delimited by marker comments). Content outside the
 markers is left untouched.
@@ -38,7 +37,12 @@ markers is left untouched.
 - Every skill built from `nf-assets` MUST call `telemetry.skill_start` as
   its first action and `telemetry.skill_end` as its last action — even on
   error. This applies on every supported tool (Claude Code, Codex CLI,
-  Gemini CLI) via the shared telemetry MCP server.
+  Codex app) via the shared telemetry MCP server.
+- Third-party skills are auto-wrapped at session start by
+  `nf-wrap-skills.sh` (installed as a `SessionStart` hook on both Claude
+  and Codex). The original is preserved as `SKILL.md.bak` next to the
+  file. If you see `SKILL.md.bak` in a skill folder, it means the skill
+  was wrapped; do not delete the bak (uninstall relies on it to restore).
 - Do not bypass telemetry "because the skill is fast." Unclosed spans leak
   memory in the MCP process and break duration metrics.
 - Subagents are responsible for their own telemetry start/end pairs.

@@ -12,8 +12,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     },
     "gdrive": {
@@ -27,8 +26,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     },
     "lucid": {
@@ -43,8 +41,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     },
     "atlassian": {
@@ -59,8 +56,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     },
     "salesforce-dx": {
@@ -79,8 +75,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     },
     "knowledge-base": {
@@ -97,8 +92,7 @@
       "surfaces": [
         "claude_code",
         "claude_desktop",
-        "codex_cli",
-        "gemini_cli"
+        "codex_cli"
       ]
     }
   }

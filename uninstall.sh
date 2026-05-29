@@ -2,13 +2,20 @@
 #
 # uninstall.sh
 #
-# Reverses what install.sh did (agentskills.io layout):
+# Reverses what install.sh did:
 #   - Removes ~/.claude/skills/<our-names>, ~/.claude/agents/<our-names>,
-#     ~/.claude/commands/<our-names>, ~/.claude/hooks/nf-telemetry-*.sh
-#   - Removes ~/.agents/skills/<our-names>  (shared Codex+Gemini destination)
-#   - Strips the nf-assets marker block from ~/.claude/CLAUDE.md,
-#     ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md
+#     ~/.claude/commands/<our-names>, ~/.claude/hooks/nf-* files
+#   - Removes ~/.codex/skills/<our-names>  (Codex destination)
+#   - Removes ~/.codex/hooks/* files we installed
+#   - Restores any SKILL.md.bak files left by the auto-wrap pass, so
+#     third-party skills are returned to their original state
+#   - Removes our SessionStart entries from ~/.claude/settings.json
+#     and ~/.codex/hooks.json
+#   - Strips the nf-assets marker block from ~/.claude/CLAUDE.md and
+#     ~/.codex/AGENTS.md
 #   - Removes MCP entries we installed (by name) from each tool's config
+#
+# Never touches ~/.codex/skills/.system/ (Codex's bundled-skill area).
 #
 # Does NOT remove the telemetry MCP — that's owned by nf-telemetry-installer.
 
@@ -63,6 +70,53 @@ strip_marker_block() {
   log "  stripped marker block from $file"
 }
 
+# Restore SKILL.md.bak files left by nf-wrap-skills.sh, so third-party
+# skills are returned to their original (unwrapped) state on uninstall.
+restore_wrap_bakups() {
+  local root="$1"
+  [ -d "$root" ] || return 0
+  local bak skill_md restored=0
+  for skill_dir in "$root"/*/; do
+    [ -d "$skill_dir" ] || continue
+    bak="${skill_dir%/}/SKILL.md.bak"
+    skill_md="${skill_dir%/}/SKILL.md"
+    if [ -f "$bak" ]; then
+      mv "$bak" "$skill_md"
+      restored=$((restored + 1))
+    fi
+  done
+  if [ "$restored" -gt 0 ]; then
+    log "  restored $restored unwrapped SKILL.md from .bak under $root"
+  fi
+}
+
+# Remove our SessionStart entry from a JSON hooks/settings file. Tag is
+# the substring we wrote into the command — the same marker used at
+# install time so we can find ourselves without disturbing other entries.
+strip_session_start_hook() {
+  local file="$1" tag="$2"
+  [ -f "$file" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  local tmp; tmp="$(mktemp)"
+  FILE="$file" TAG="$tag" OUT="$tmp" node -e '
+    const fs = require("fs");
+    const cfg = JSON.parse(fs.readFileSync(process.env.FILE, "utf8") || "{}");
+    if (!cfg.hooks || !cfg.hooks.SessionStart) {
+      fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
+      return;
+    }
+    const tag = process.env.TAG;
+    cfg.hooks.SessionStart = cfg.hooks.SessionStart.filter(e =>
+      !(e.hooks || []).some(h => h.command && h.command.includes(tag))
+    );
+    if (cfg.hooks.SessionStart.length === 0) delete cfg.hooks.SessionStart;
+    if (Object.keys(cfg.hooks).length === 0) delete cfg.hooks;
+    fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
+  '
+  mv "$tmp" "$file"
+  log "  stripped $tag SessionStart entry from $file"
+}
+
 uninstall_claude() {
   local home="$HOME/.claude"
   [ -d "$home" ] || return 0
@@ -86,7 +140,18 @@ uninstall_claude() {
       log "  -claude command: $n"
     fi
   done
-  rm -f "$home/hooks/nf-telemetry-skill-start.sh" "$home/hooks/nf-telemetry-skill-end.sh"
+  rm -f "$home/hooks/nf-telemetry-skill-start.sh" \
+        "$home/hooks/nf-telemetry-skill-end.sh" \
+        "$home/hooks/nf-wrap-skills.sh" \
+        "$home/hooks/wrap-thirdparty-skill.sh" \
+        "$home/hooks/SKILL_PREAMBLE.md" \
+        "$home/hooks/SKILL_POSTAMBLE.md"
+
+  # Restore any third-party SKILL.md files we wrapped.
+  restore_wrap_bakups "$home/skills"
+
+  # Drop our SessionStart entry from Claude's settings.
+  strip_session_start_hook "$home/settings.json" "nf-wrap-skills"
 
   strip_marker_block "$home/CLAUDE.md"
 
@@ -99,62 +164,50 @@ uninstall_claude() {
   fi
 }
 
-uninstall_agents_shared() {
-  local agents_skills="$HOME/.agents/skills"
-  if [ -d "$agents_skills" ]; then
+uninstall_codex() {
+  [ -d "$HOME/.codex" ] || return 0
+
+  local codex_skills="$HOME/.codex/skills"
+  if [ -d "$codex_skills" ]; then
     for n in $(skill_names); do
-      if [ -d "$agents_skills/$n" ]; then
-        rm -rf "$agents_skills/$n"
-        log "  -shared skill: $n"
+      # Never touch .system — that's Codex's bundled-skill area.
+      [ "$n" = ".system" ] && continue
+      if [ -d "$codex_skills/$n" ]; then
+        rm -rf "$codex_skills/$n"
+        log "  -codex skill: $n"
       fi
     done
+
+    # Restore any third-party SKILL.md files we wrapped, including any
+    # under .system/ defensively (we should never have wrapped them, but
+    # if we ever did, restore is harmless).
+    restore_wrap_bakups "$codex_skills"
   fi
 
-  # Strip the nf-assets rules block from Codex's AGENTS.md if present
-  if [ -d "$HOME/.codex" ]; then
-    strip_marker_block "$HOME/.codex/AGENTS.md"
+  rm -f "$HOME/.codex/hooks/nf-wrap-skills.sh" \
+        "$HOME/.codex/hooks/wrap-thirdparty-skill.sh" \
+        "$HOME/.codex/hooks/SKILL_PREAMBLE.md" \
+        "$HOME/.codex/hooks/SKILL_POSTAMBLE.md"
 
-    # Strip the nf-assets mcp block from config.toml
-    local cfg="$HOME/.codex/config.toml"
-    if [ -f "$cfg" ]; then
-      local tmp; tmp="$(mktemp)"
-      awk '
-        /^# BEGIN nf-assets mcp$/ { skipping = 1; next }
-        /^# END nf-assets mcp$/   { skipping = 0; next }
-        !skipping { print }
-      ' "$cfg" > "$tmp"
-      mv "$tmp" "$cfg"
-      log "  stripped nf-assets mcp block from $cfg"
-    fi
-  fi
+  strip_session_start_hook "$HOME/.codex/hooks.json" "nf-wrap-skills"
 
-  # Strip the nf-assets rules block from Gemini's GEMINI.md and remove
-  # MCP entries from settings.json.
-  if [ -d "$HOME/.gemini" ]; then
-    strip_marker_block "$HOME/.gemini/GEMINI.md"
+  strip_marker_block "$HOME/.codex/AGENTS.md"
 
-    if command -v node >/dev/null 2>&1; then
-      local cfg="$HOME/.gemini/settings.json"
-      if [ -f "$cfg" ]; then
-        local tmp; tmp="$(mktemp)"
-        NAMES="$(mcp_names | tr '\n' ',')" CFG="$cfg" OUT="$tmp" node -e '
-          const fs = require("fs");
-          const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8") || "{}");
-          const names = (process.env.NAMES || "").split(",").filter(Boolean);
-          cfg.mcpServers = cfg.mcpServers || {};
-          for (const n of names) {
-            if (cfg.mcpServers[n]) { delete cfg.mcpServers[n]; console.error(`[nf-assets]   -gemini mcp: ${n}`); }
-          }
-          fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
-        '
-        mv "$tmp" "$cfg"
-      fi
-    fi
+  local cfg="$HOME/.codex/config.toml"
+  if [ -f "$cfg" ]; then
+    local tmp; tmp="$(mktemp)"
+    awk '
+      /^# BEGIN nf-assets mcp$/ { skipping = 1; next }
+      /^# END nf-assets mcp$/   { skipping = 0; next }
+      !skipping { print }
+    ' "$cfg" > "$tmp"
+    mv "$tmp" "$cfg"
+    log "  stripped nf-assets mcp block from $cfg"
   fi
 }
 
 uninstall_claude
-uninstall_agents_shared
+uninstall_codex
 
 cat <<EOF
 

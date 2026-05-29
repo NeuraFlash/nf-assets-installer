@@ -27,9 +27,19 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PREAMBLE="$ROOT/global/SKILL_PREAMBLE.md"
-POSTAMBLE="$ROOT/global/SKILL_POSTAMBLE.md"
+# Preamble/postamble lookup:
+#   1) $NF_WRAP_PREAMBLE_DIR if set — used when this script is installed
+#      into a tool's hooks dir alongside the preamble files.
+#   2) $ROOT/global/ — used when running from a repo checkout.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "${NF_WRAP_PREAMBLE_DIR:-}" ]; then
+  PREAMBLE="$NF_WRAP_PREAMBLE_DIR/SKILL_PREAMBLE.md"
+  POSTAMBLE="$NF_WRAP_PREAMBLE_DIR/SKILL_POSTAMBLE.md"
+else
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  PREAMBLE="$ROOT/global/SKILL_PREAMBLE.md"
+  POSTAMBLE="$ROOT/global/SKILL_POSTAMBLE.md"
+fi
 
 [ "$#" -ge 1 ] || { echo "Usage: $0 <path-to-SKILL.md> [output-path]" >&2; exit 2; }
 SRC="$1"
@@ -50,9 +60,34 @@ if grep -qE '^## Step 0 — start telemetry' "$SRC"; then
   exit 0
 fi
 
+# Extract `name:` from the YAML frontmatter so the wrapped Step 0 block
+# emits telemetry under the skill's real identity. Falls back to the
+# parent dir name if the field is missing or malformed.
+SKILL_NAME="$(awk '
+  NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; next }
+  in_fm && /^---[[:space:]]*$/   { exit }
+  in_fm && /^name:[[:space:]]*/ {
+    sub(/^name:[[:space:]]*/, "")
+    gsub(/^["'\'']|["'\'']$/, "")
+    print
+    exit
+  }
+' "$SRC")"
+if [ -z "$SKILL_NAME" ]; then
+  SKILL_NAME="$(basename "$(dirname "$SRC")")"
+  echo "[wrap] $SRC frontmatter missing name; using folder name '$SKILL_NAME'" >&2
+fi
+
+# Render preamble with {{SKILL_NAME}} substituted to the skill's real name.
+PREAMBLE_RENDERED="$(mktemp)"
+trap 'rm -f "$PREAMBLE_RENDERED"' EXIT INT TERM
+SKILL_NAME="$SKILL_NAME" awk '
+  { gsub(/\{\{SKILL_NAME\}\}/, ENVIRON["SKILL_NAME"]); print }
+' "$PREAMBLE" > "$PREAMBLE_RENDERED"
+
 # Same splicing logic as scripts/build-skills.sh — keep them in sync if you
 # change the structure of the preamble/postamble blocks.
-awk -v preamble="$PREAMBLE" -v postamble="$POSTAMBLE" '
+awk -v preamble="$PREAMBLE_RENDERED" -v postamble="$POSTAMBLE" '
   BEGIN { in_fm = 0; fm_done = 0 }
   NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; print; next }
   in_fm && /^---[[:space:]]*$/   { in_fm = 0; fm_done = 1; print

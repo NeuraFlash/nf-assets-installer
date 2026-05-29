@@ -2,21 +2,26 @@
 #
 # install.sh
 #
-# Bootstrap installer for NeuraFlash AI coding assets, now conforming to the
-# open Agent Skills specification at https://agentskills.io/specification.
+# Bootstrap installer for NeuraFlash AI coding assets. Skills follow the
+# open Agent Skills specification (https://agentskills.io/specification),
+# but each tool reads from its own home dir rather than a shared location.
 #
 # Each skills/<name>/ is a self-contained canonical SKILL.md folder. The
 # installer copies those folders unchanged to:
 #   - ~/.claude/skills/<name>/   (Claude Code)
-#   - ~/.agents/skills/<name>/   (Codex CLI + Gemini CLI, shared per spec)
+#   - ~/.codex/skills/<name>/    (OpenAI Codex CLI + Codex app — both read
+#                                 from the same CODEX_HOME)
+#
+# Codex reserves ~/.codex/skills/.system/ for its bundled system skills;
+# this installer never writes there. After installing, restart Codex so
+# it reloads the skill list.
 #
 # Idempotent — rerunning upgrades skills/agents/commands and re-merges global
 # rules files + MCP entries.
 #
 # Surfaces handled (detected by presence of the corresponding home dir):
 #   - Claude Code         (~/.claude)
-#   - OpenAI Codex CLI    (~/.codex)        — uses ~/.agents/skills/
-#   - Google Antigravity  (~/.gemini)       — uses ~/.agents/skills/
+#   - OpenAI Codex CLI    (~/.codex)
 #
 # Claude Desktop config is also written if the Desktop app dir is present
 # alongside ~/.claude. MCP entries flagged claude_desktop go there.
@@ -85,19 +90,13 @@ CLAUDE_HOOKS="$CLAUDE_HOME/hooks"
 CLAUDE_MD="$CLAUDE_HOME/CLAUDE.md"
 CLAUDE_SETTINGS="$CLAUDE_HOME/settings.json"
 
-# Codex CLI
+# Codex CLI (and Codex app — both surfaces read from CODEX_HOME)
 CODEX_HOME="$HOME/.codex"
+CODEX_SKILLS="$CODEX_HOME/skills"
+CODEX_HOOKS="$CODEX_HOME/hooks"
 CODEX_AGENTS_MD="$CODEX_HOME/AGENTS.md"
 CODEX_CONFIG_TOML="$CODEX_HOME/config.toml"
-
-# Antigravity / Gemini CLI
-GEMINI_HOME="$HOME/.gemini"
-GEMINI_MD="$GEMINI_HOME/GEMINI.md"
-GEMINI_SETTINGS="$GEMINI_HOME/settings.json"
-
-# Shared agentskills.io destination for Codex + Gemini
-AGENTS_HOME="$HOME/.agents"
-AGENTS_SKILLS="$AGENTS_HOME/skills"
+CODEX_HOOKS_JSON="$CODEX_HOME/hooks.json"
 
 # Claude Desktop
 case "$(uname -s)" in
@@ -262,24 +261,35 @@ install_claude_hooks() {
     log "  claude hook: $name"
   done
 
+  # nf-wrap-skills.sh runs wrap-thirdparty-skill.sh as a subprocess and
+  # expects the preamble/postamble next to it, so co-locate them all.
+  cp "$REPO_ROOT/scripts/wrap-thirdparty-skill.sh" "$CLAUDE_HOOKS/wrap-thirdparty-skill.sh"
+  chmod +x "$CLAUDE_HOOKS/wrap-thirdparty-skill.sh"
+  cp "$REPO_ROOT/global/SKILL_PREAMBLE.md"  "$CLAUDE_HOOKS/SKILL_PREAMBLE.md"
+  cp "$REPO_ROOT/global/SKILL_POSTAMBLE.md" "$CLAUDE_HOOKS/SKILL_POSTAMBLE.md"
+
   command -v node >/dev/null 2>&1 || { warn "node missing — hooks copied but $CLAUDE_SETTINGS not wired."; return 0; }
 
   [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
   local tmp; tmp="$(mktemp)"
-  SETTINGS="$CLAUDE_SETTINGS" HOOKS_DIR="$CLAUDE_HOOKS" OUT="$tmp" node -e '
+  SETTINGS="$CLAUDE_SETTINGS" HOOKS_DIR="$CLAUDE_HOOKS" SKILLS_DIR="$CLAUDE_SKILLS" OUT="$tmp" node -e '
     const fs = require("fs");
     const startCmd = `${process.env.HOOKS_DIR}/nf-telemetry-skill-start.sh`;
     const endCmd   = `${process.env.HOOKS_DIR}/nf-telemetry-skill-end.sh`;
+    const wrapCmd  = `NF_WRAP_PREAMBLE_DIR="${process.env.HOOKS_DIR}" "${process.env.HOOKS_DIR}/nf-wrap-skills.sh" "${process.env.SKILLS_DIR}"`;
     const cfg = JSON.parse(fs.readFileSync(process.env.SETTINGS, "utf8") || "{}");
     cfg.hooks = cfg.hooks || {};
-    const isOurs = (entry) =>
-      (entry.hooks || []).some(h => h.command && h.command.includes("nf-telemetry-skill-"));
-    const upsert = (event, cmd) => {
-      cfg.hooks[event] = (cfg.hooks[event] || []).filter(e => !isOurs(e));
-      cfg.hooks[event].push({ matcher: "Skill", hooks: [{ type: "command", command: cmd }] });
+    const tagsOurs = (entry, tag) =>
+      (entry.hooks || []).some(h => h.command && h.command.includes(tag));
+    const upsert = (event, matcher, tag, cmd) => {
+      cfg.hooks[event] = (cfg.hooks[event] || []).filter(e => !tagsOurs(e, tag));
+      const entry = { hooks: [{ type: "command", command: cmd }] };
+      if (matcher) entry.matcher = matcher;
+      cfg.hooks[event].push(entry);
     };
-    upsert("PreToolUse",  startCmd);
-    upsert("PostToolUse", endCmd);
+    upsert("PreToolUse",   "Skill", "nf-telemetry-skill-start", startCmd);
+    upsert("PostToolUse",  "Skill", "nf-telemetry-skill-end",   endCmd);
+    upsert("SessionStart", null,    "nf-wrap-skills",           wrapCmd);
     fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
   '
   mv "$tmp" "$CLAUDE_SETTINGS"
@@ -312,106 +322,121 @@ install_claude_desktop_mcp() {
   mv "$tmp" "$DESKTOP_CFG"
 }
 
-# ---- Codex + Gemini shared install ------------------------------------------
+# ---- Codex install ----------------------------------------------------------
 
-# Single function that handles ~/.agents/skills/ for Codex AND Gemini,
-# plus each tool's own rules-file merge and MCP-config write.
-install_agents_shared() {
-  local have_codex=0 have_gemini=0
-  [ -d "$CODEX_HOME"  ] && have_codex=1
-  [ -d "$GEMINI_HOME" ] && have_gemini=1
-  if [ "$have_codex" -eq 0 ] && [ "$have_gemini" -eq 0 ]; then
-    log "neither ~/.codex nor ~/.gemini found — skipping shared agents install."
-    return 0
+# Installs skills into ~/.codex/skills/ (consumed by both the Codex CLI and
+# the Codex app, which share CODEX_HOME), plus AGENTS.md rules and the
+# config.toml MCP block. Codex reserves ~/.codex/skills/.system/ for its
+# bundled system skills — install_skills_to never writes there because the
+# source loop only iterates real skill folders in this repo.
+install_codex() {
+  [ -d "$CODEX_HOME" ] || { log "~/.codex not found — skipping Codex."; return 0; }
+
+  log "Installing Codex skills into $CODEX_SKILLS"
+  install_skills_to "$CODEX_SKILLS"
+
+  log "Installing Codex CLI bits into $CODEX_HOME"
+  merge_global_rules "$RULES_MD" "$CODEX_AGENTS_MD"
+  log "  codex rules: merged into $CODEX_AGENTS_MD"
+
+  if command -v node >/dev/null 2>&1; then
+    [ -f "$CODEX_CONFIG_TOML" ] || touch "$CODEX_CONFIG_TOML"
+    SERVERS="$REPO_ROOT/mcp/servers.json" CFG="$CODEX_CONFIG_TOML" node -e '
+      const fs = require("fs");
+      const path = process.env.CFG;
+      const src = JSON.parse(fs.readFileSync(process.env.SERVERS, "utf8"));
+
+      const tomlEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+
+      const renderEntry = (name, def) => {
+        const lines = [];
+        lines.push(`[mcp_servers.${name}]`);
+        lines.push(`command = "${tomlEscape(def.command)}"`);
+        const args = (def.args || []).map(a => `"${tomlEscape(a)}"`).join(", ");
+        lines.push(`args = [${args}]`);
+        const env = def.env || {};
+        const envPairs = Object.entries(env)
+          .map(([k, v]) => `${k} = "${tomlEscape(v)}"`).join(", ");
+        lines.push(`env = { ${envPairs} }`);
+        return lines.join("\n") + "\n";
+      };
+
+      let body = fs.readFileSync(path, "utf8");
+      const MARK_BEGIN = "# BEGIN nf-assets mcp\n";
+      const MARK_END   = "# END nf-assets mcp\n";
+
+      let block = MARK_BEGIN;
+      for (const [name, def] of Object.entries(src.servers || {})) {
+        if (!(def.surfaces || []).includes("codex_cli")) continue;
+        block += renderEntry(name, def) + "\n";
+        console.error(`[nf-assets]   codex mcp: ${name}`);
+      }
+      block += MARK_END;
+
+      const beginIdx = body.indexOf(MARK_BEGIN);
+      const endIdx   = body.indexOf(MARK_END);
+      if (beginIdx >= 0 && endIdx > beginIdx) {
+        body = body.slice(0, beginIdx) + block + body.slice(endIdx + MARK_END.length);
+      } else {
+        body = body.trimEnd() + (body ? "\n\n" : "") + block;
+      }
+      fs.writeFileSync(path, body);
+    '
+  else
+    warn "node missing — Codex MCP entries skipped."
   fi
 
-  # 1) Shared skill folders — written once, consumed by both Codex and Gemini
-  log "Installing shared skills into $AGENTS_SKILLS"
-  install_skills_to "$AGENTS_SKILLS"
+  install_codex_hooks
+}
 
-  # 2) Codex-specific: AGENTS.md rules + config.toml MCP block
-  if [ "$have_codex" -eq 1 ]; then
-    log "Installing Codex CLI bits into $CODEX_HOME"
-    merge_global_rules "$RULES_MD" "$CODEX_AGENTS_MD"
-    log "  codex rules: merged into $CODEX_AGENTS_MD"
+# Drops nf-wrap-skills.sh (+ preamble/postamble/wrap-thirdparty-skill.sh)
+# into ~/.codex/hooks/ and registers a SessionStart entry in
+# ~/.codex/hooks.json so any unwrapped SKILL.md gets wrapped at the start
+# of every Codex session (covers skills the user installs between runs of
+# this installer).
+install_codex_hooks() {
+  mkdir -p "$CODEX_HOOKS"
 
-    if command -v node >/dev/null 2>&1; then
-      [ -f "$CODEX_CONFIG_TOML" ] || touch "$CODEX_CONFIG_TOML"
-      SERVERS="$REPO_ROOT/mcp/servers.json" CFG="$CODEX_CONFIG_TOML" node -e '
-        const fs = require("fs");
-        const path = process.env.CFG;
-        const src = JSON.parse(fs.readFileSync(process.env.SERVERS, "utf8"));
+  cp "$REPO_ROOT/global/hooks/nf-wrap-skills.sh" "$CODEX_HOOKS/nf-wrap-skills.sh"
+  chmod +x "$CODEX_HOOKS/nf-wrap-skills.sh"
+  cp "$REPO_ROOT/scripts/wrap-thirdparty-skill.sh" "$CODEX_HOOKS/wrap-thirdparty-skill.sh"
+  chmod +x "$CODEX_HOOKS/wrap-thirdparty-skill.sh"
+  cp "$REPO_ROOT/global/SKILL_PREAMBLE.md"  "$CODEX_HOOKS/SKILL_PREAMBLE.md"
+  cp "$REPO_ROOT/global/SKILL_POSTAMBLE.md" "$CODEX_HOOKS/SKILL_POSTAMBLE.md"
+  log "  codex hook: nf-wrap-skills.sh (+ preamble/postamble)"
 
-        const tomlEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+  command -v node >/dev/null 2>&1 || { warn "node missing — codex hooks copied but $CODEX_HOOKS_JSON not wired."; return 0; }
 
-        const renderEntry = (name, def) => {
-          const lines = [];
-          lines.push(`[mcp_servers.${name}]`);
-          lines.push(`command = "${tomlEscape(def.command)}"`);
-          const args = (def.args || []).map(a => `"${tomlEscape(a)}"`).join(", ");
-          lines.push(`args = [${args}]`);
-          const env = def.env || {};
-          const envPairs = Object.entries(env)
-            .map(([k, v]) => `${k} = "${tomlEscape(v)}"`).join(", ");
-          lines.push(`env = { ${envPairs} }`);
-          return lines.join("\n") + "\n";
-        };
+  [ -f "$CODEX_HOOKS_JSON" ] || echo '{}' > "$CODEX_HOOKS_JSON"
+  local tmp; tmp="$(mktemp)"
+  HOOKS_FILE="$CODEX_HOOKS_JSON" HOOKS_DIR="$CODEX_HOOKS" SKILLS_DIR="$CODEX_SKILLS" OUT="$tmp" node -e '
+    const fs = require("fs");
+    const wrapCmd = `NF_WRAP_PREAMBLE_DIR="${process.env.HOOKS_DIR}" "${process.env.HOOKS_DIR}/nf-wrap-skills.sh" "${process.env.SKILLS_DIR}"`;
+    const cfg = JSON.parse(fs.readFileSync(process.env.HOOKS_FILE, "utf8") || "{}");
+    cfg.hooks = cfg.hooks || {};
+    const isOurs = (entry) =>
+      (entry.hooks || []).some(h => h.command && h.command.includes("nf-wrap-skills"));
+    cfg.hooks.SessionStart = (cfg.hooks.SessionStart || []).filter(e => !isOurs(e));
+    cfg.hooks.SessionStart.push({ hooks: [{ type: "command", command: wrapCmd }] });
+    fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
+  '
+  mv "$tmp" "$CODEX_HOOKS_JSON"
+  log "  codex SessionStart hook wired into $CODEX_HOOKS_JSON"
+}
 
-        let body = fs.readFileSync(path, "utf8");
-        const MARK_BEGIN = "# BEGIN nf-assets mcp\n";
-        const MARK_END   = "# END nf-assets mcp\n";
-
-        let block = MARK_BEGIN;
-        for (const [name, def] of Object.entries(src.servers || {})) {
-          if (!(def.surfaces || []).includes("codex_cli")) continue;
-          block += renderEntry(name, def) + "\n";
-          console.error(`[nf-assets]   codex mcp: ${name}`);
-        }
-        block += MARK_END;
-
-        const beginIdx = body.indexOf(MARK_BEGIN);
-        const endIdx   = body.indexOf(MARK_END);
-        if (beginIdx >= 0 && endIdx > beginIdx) {
-          body = body.slice(0, beginIdx) + block + body.slice(endIdx + MARK_END.length);
-        } else {
-          body = body.trimEnd() + (body ? "\n\n" : "") + block;
-        }
-        fs.writeFileSync(path, body);
-      '
-    else
-      warn "node missing — Codex MCP entries skipped."
-    fi
+# Runs the wrap pass synchronously over both skill roots so the user gets
+# coverage immediately, not just after restarting their next session.
+run_wrap_pass() {
+  local script
+  if [ -d "$CODEX_HOME" ] && [ -x "$CODEX_HOOKS/nf-wrap-skills.sh" ]; then
+    script="$CODEX_HOOKS/nf-wrap-skills.sh"
+    log "Wrapping unwrapped SKILL.md files under $CODEX_SKILLS"
+    NF_WRAP_PREAMBLE_DIR="$CODEX_HOOKS" "$script" "$CODEX_SKILLS" || true
   fi
-
-  # 3) Gemini-specific: GEMINI.md rules + settings.json MCP block
-  if [ "$have_gemini" -eq 1 ]; then
-    log "Installing Gemini CLI bits into $GEMINI_HOME"
-    merge_global_rules "$RULES_MD" "$GEMINI_MD"
-    log "  gemini rules: merged into $GEMINI_MD"
-
-    if command -v node >/dev/null 2>&1; then
-      [ -f "$GEMINI_SETTINGS" ] || echo '{}' > "$GEMINI_SETTINGS"
-      local tmp; tmp="$(mktemp)"
-      SERVERS="$REPO_ROOT/mcp/servers.json" CFG="$GEMINI_SETTINGS" OUT="$tmp" node -e '
-        const fs = require("fs");
-        const src = JSON.parse(fs.readFileSync(process.env.SERVERS, "utf8"));
-        const cfg = JSON.parse(fs.readFileSync(process.env.CFG, "utf8") || "{}");
-        cfg.mcpServers = cfg.mcpServers || {};
-        for (const [name, def] of Object.entries(src.servers || {})) {
-          if (!(def.surfaces || []).includes("gemini_cli")) continue;
-          cfg.mcpServers[name] = {
-            command: def.command,
-            args:    def.args || [],
-            env:     def.env || {}
-          };
-          console.error(`[nf-assets]   gemini mcp: ${name}`);
-        }
-        fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
-      '
-      mv "$tmp" "$GEMINI_SETTINGS"
-    else
-      warn "node missing — Gemini MCP entries skipped."
-    fi
+  if [ -d "$CLAUDE_HOME" ] && [ -x "$CLAUDE_HOOKS/nf-wrap-skills.sh" ]; then
+    script="$CLAUDE_HOOKS/nf-wrap-skills.sh"
+    log "Wrapping unwrapped SKILL.md files under $CLAUDE_SKILLS"
+    NF_WRAP_PREAMBLE_DIR="$CLAUDE_HOOKS" "$script" "$CLAUDE_SKILLS" || true
   fi
 }
 
@@ -422,7 +447,8 @@ main() {
 
   install_claude
   install_claude_desktop_mcp
-  install_agents_shared
+  install_codex
+  run_wrap_pass
 
   cat <<EOF
 
@@ -430,6 +456,7 @@ main() {
 
 Next steps:
   • Open a new Claude Code session to pick up new skills/agents/commands.
+  • Restart Codex (CLI and app) so it reloads the skill list from ~/.codex/skills/.
   • Restart Claude Desktop if any MCP entries changed.
   • First-time MCP auth: as documented in mcp/servers.json descriptions.
 EOF
